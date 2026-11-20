@@ -1,5 +1,9 @@
 import os
 import uuid
+import secrets
+import io
+import base64
+import qrcode
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from decimal import Decimal, InvalidOperation
@@ -85,6 +89,7 @@ def inicializar():
     reservas.create_index([('reserva_id',ASCENDING),('estado',ASCENDING)])
     reservas.create_index([('estado',ASCENDING),('vence_en',ASCENDING)])
     pedidos.create_index('reserva_doc_id', unique=True)
+    pedidos.create_index('qr_token', unique=True, sparse=True)
     # Inicializa documentos anteriores sin alterar cantidades existentes.
     productos.update_many({'reservadas': {'$exists': False}}, {'$set': {'reservadas':0}})
 
@@ -204,7 +209,7 @@ def cerrar_reserva(accion):
                     if accion=='confirmar': cambio['existencias']=-item['cantidad']
                     productos.update_one({'_id':item['producto_id']},{'$inc':cambio},session=s)
                 if accion=='confirmar':
-                    pedidos.insert_one(dict(reserva_doc_id=r['_id'], usuario_id=r['usuario_id'], items=r['items'], total=r['total'], fecha=ahora(), estado='Simulada'),session=s)
+                    pedidos.insert_one(dict(reserva_doc_id=r['_id'], usuario_id=r['usuario_id'], items=r['items'], total=r['total'], fecha=ahora(), estado='Simulada', qr_token=secrets.token_urlsafe(32)),session=s)
         if accion=='confirmar': session['carrito']={}
         flash('¡Compra simulada confirmada! No se realizó ningún cobro.' if accion=='confirmar' else 'Reserva cancelada. Existencias devueltas.', 'success')
         return redirect(url_for('mis_compras') if accion=='confirmar' else url_for('carrito'))
@@ -227,7 +232,32 @@ def cancelar(): return cerrar_reserva('cancelar')
 @app.route('/mis-compras')
 @login_required
 def mis_compras():
-    return render_template('compras.html', pedidos=list(pedidos.find({'usuario_id':oid(session['usuario_id'])}).sort('fecha',-1)))
+    lista=list(pedidos.find({'usuario_id':oid(session['usuario_id'])}).sort('fecha',-1))
+    for pedido in lista:
+        if not pedido.get('qr_token'):
+            token=secrets.token_urlsafe(32)
+            resultado=pedidos.update_one({'_id':pedido['_id'],'qr_token':{'$exists':False}},{'$set':{'qr_token':token}})
+            if resultado.modified_count: pedido['qr_token']=token
+            else:
+                actualizado=pedidos.find_one({'_id':pedido['_id']},{'qr_token':1})
+                pedido['qr_token']=actualizado.get('qr_token') if actualizado else None
+        if pedido.get('qr_token'):
+            url=url_for('verificar_pedido', token=pedido['qr_token'], _external=True)
+            img=qrcode.make(url)
+            buffer=io.BytesIO();img.save(buffer,format='PNG')
+            pedido['qr_imagen']='data:image/png;base64,'+base64.b64encode(buffer.getvalue()).decode('ascii')
+            pedido['qr_url']=url
+    return render_template('compras.html', pedidos=lista)
+
+
+@app.get('/verificar-pedido/<token>')
+def verificar_pedido(token):
+    if not (20 <= len(token) <= 128):
+        abort(404)
+    pedido=pedidos.find_one({'qr_token':token})
+    if not pedido:
+        abort(404)
+    return render_template('verificar_pedido.html',pedido=pedido)
 
 
 @app.route('/registro',methods=['GET','POST'])
