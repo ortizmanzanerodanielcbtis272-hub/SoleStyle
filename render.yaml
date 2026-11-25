@@ -3,7 +3,7 @@ services:
     name: solestyle-calzado
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 90
+    startCommand: python setup_admin.py && gunicorn app:app
     envVars:
       - key: MONGO_URI
         sync: false

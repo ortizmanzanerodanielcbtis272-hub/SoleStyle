@@ -128,3 +128,12 @@ SoleStyle_Calzado/
 - Esta es una aplicación educativa de compras simuladas, **no** una pasarela de pagos.
 - Las imágenes se cargan mediante URL externa opcional; no se guardan archivos en el disco efímero de Render.
 - Para producción real, añade protección CSRF, limitación de intentos de login, auditoría y pruebas de carga.
+
+## Códigos QR
+Instala las dependencias con `python -m pip install -r requirements.txt`.
+Conserva tu .env original. En Render puedes definir PUBLIC_BASE_URL con la URL HTTPS de tu sitio (sin barra final). En local, localhost no es accesible desde otro celular; usa la URL desplegada para probar escaneos.
+- Producto: abre su detalle y escanea o descarga el PNG.
+- Reserva: agrega un producto, reserva y abre «Ver ficha y QR de reserva». Tras cinco minutos vuelve a escanear para verificar el estado vencido.
+- Compra: confirma una reserva y abre Mis compras > Ver comprobante y QR.
+- Las fichas de reserva y compra requieren sesión del titular o administrador; prueba también con una cuenta distinta (debe recibir 403).
+- No se requiere migración de documentos. Los QR se generan al solicitarse.

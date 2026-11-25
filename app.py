@@ -1,14 +1,12 @@
 import os
 import uuid
-import secrets
-import io
-import base64
+from io import BytesIO
 import qrcode
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from decimal import Decimal, InvalidOperation
 from bson import ObjectId
-from flask import Flask, render_template, request, redirect, url_for, flash, session, jsonify, abort
+from flask import Flask, render_template, request, redirect, url_for, flash, session, jsonify, abort, send_file
 from pymongo import MongoClient, ReturnDocument, ASCENDING
 from pymongo.errors import PyMongoError
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -50,7 +48,7 @@ def login_required(fn):
     @wraps(fn)
     def inner(*args, **kwargs):
         if not usuario_actual():
-            flash('Inicia sesión para continuar.', 'warning'); return redirect(url_for('login'))
+            flash('Inicia sesión para continuar.', 'warning'); return redirect(url_for('login', destino=request.endpoint, documento=kwargs.get('id','')))
         return fn(*args, **kwargs)
     return inner
 
@@ -89,7 +87,6 @@ def inicializar():
     reservas.create_index([('reserva_id',ASCENDING),('estado',ASCENDING)])
     reservas.create_index([('estado',ASCENDING),('vence_en',ASCENDING)])
     pedidos.create_index('reserva_doc_id', unique=True)
-    pedidos.create_index('qr_token', unique=True, sparse=True)
     # Inicializa documentos anteriores sin alterar cantidades existentes.
     productos.update_many({'reservadas': {'$exists': False}}, {'$set': {'reservadas':0}})
 
@@ -209,7 +206,7 @@ def cerrar_reserva(accion):
                     if accion=='confirmar': cambio['existencias']=-item['cantidad']
                     productos.update_one({'_id':item['producto_id']},{'$inc':cambio},session=s)
                 if accion=='confirmar':
-                    pedidos.insert_one(dict(reserva_doc_id=r['_id'], usuario_id=r['usuario_id'], items=r['items'], total=r['total'], fecha=ahora(), estado='Simulada', qr_token=secrets.token_urlsafe(32)),session=s)
+                    pedidos.insert_one(dict(reserva_doc_id=r['_id'], usuario_id=r['usuario_id'], items=r['items'], total=r['total'], fecha=ahora(), estado='Simulada'),session=s)
         if accion=='confirmar': session['carrito']={}
         flash('¡Compra simulada confirmada! No se realizó ningún cobro.' if accion=='confirmar' else 'Reserva cancelada. Existencias devueltas.', 'success')
         return redirect(url_for('mis_compras') if accion=='confirmar' else url_for('carrito'))
@@ -232,32 +229,7 @@ def cancelar(): return cerrar_reserva('cancelar')
 @app.route('/mis-compras')
 @login_required
 def mis_compras():
-    lista=list(pedidos.find({'usuario_id':oid(session['usuario_id'])}).sort('fecha',-1))
-    for pedido in lista:
-        if not pedido.get('qr_token'):
-            token=secrets.token_urlsafe(32)
-            resultado=pedidos.update_one({'_id':pedido['_id'],'qr_token':{'$exists':False}},{'$set':{'qr_token':token}})
-            if resultado.modified_count: pedido['qr_token']=token
-            else:
-                actualizado=pedidos.find_one({'_id':pedido['_id']},{'qr_token':1})
-                pedido['qr_token']=actualizado.get('qr_token') if actualizado else None
-        if pedido.get('qr_token'):
-            url=url_for('verificar_pedido', token=pedido['qr_token'], _external=True)
-            img=qrcode.make(url)
-            buffer=io.BytesIO();img.save(buffer,format='PNG')
-            pedido['qr_imagen']='data:image/png;base64,'+base64.b64encode(buffer.getvalue()).decode('ascii')
-            pedido['qr_url']=url
-    return render_template('compras.html', pedidos=lista)
-
-
-@app.get('/verificar-pedido/<token>')
-def verificar_pedido(token):
-    if not (20 <= len(token) <= 128):
-        abort(404)
-    pedido=pedidos.find_one({'qr_token':token})
-    if not pedido:
-        abort(404)
-    return render_template('verificar_pedido.html',pedido=pedido)
+    return render_template('compras.html', pedidos=list(pedidos.find({'usuario_id':oid(session['usuario_id'])}).sort('fecha',-1)))
 
 
 @app.route('/registro',methods=['GET','POST'])
@@ -279,6 +251,10 @@ def login():
         u=usuarios.find_one({'correo':request.form.get('correo','').strip().lower()})
         if u and check_password_hash(u['clave_hash'],request.form.get('clave','')):
             session.clear(); session['usuario_id']=str(u['_id']); session['reserva_id']=uuid.uuid4().hex
+            destino = request.args.get('destino')
+            documento = request.args.get('documento', '')
+            if destino in ('ficha_reserva', 'comprobante') and ObjectId.is_valid(documento):
+                return redirect(url_for(destino, id=documento))
             return redirect(url_for('index'))
         flash('Credenciales incorrectas.','danger')
     return render_template('auth.html', registro=False)
@@ -376,6 +352,50 @@ def api_reserva_actual():
     r=reservas.find_one({'reserva_id':folio(),'usuario_id':oid(session['usuario_id']),'estado':'activa'})
     if not r:return jsonify(activa=False)
     return jsonify(activa=True,estado=r['estado'],vence_en=r['vence_en'].isoformat(),reserva_id=r['reserva_id'])
+
+
+def qr_documento(coleccion, id):
+    doc = coleccion.find_one({'_id': oid(id)})
+    if not doc: abort(404)
+    user = usuario_actual()
+    if not user or (not user.get('admin') and doc['usuario_id'] != user['_id']): abort(403)
+    return doc
+
+
+@app.get('/reserva/<id>/ficha')
+@login_required
+def ficha_reserva(id):
+    doc = qr_documento(reservas, id)
+    if doc['estado'] == 'activa' and doc['vence_en'] <= ahora():
+        doc['estado'] = 'vencida'
+    return render_template('ficha_qr.html', doc=doc, tipo='reserva', id=id)
+
+
+@app.get('/compra/<id>/comprobante')
+@login_required
+def comprobante(id):
+    doc = qr_documento(pedidos, id)
+    return render_template('ficha_qr.html', doc=doc, tipo='compra', id=id)
+
+
+@app.get('/qr/<tipo>/<id>.png')
+def codigo_qr(tipo, id):
+    if tipo == 'producto':
+        if not productos.find_one({'_id': oid(id)}): abort(404)
+        endpoint = 'detalle'
+    elif tipo in ('reserva', 'compra'):
+        if not usuario_actual(): return redirect(url_for('login'))
+        qr_documento(reservas if tipo == 'reserva' else pedidos, id)
+        endpoint = 'ficha_reserva' if tipo == 'reserva' else 'comprobante'
+    else: abort(404)
+    base = os.getenv('PUBLIC_BASE_URL', '').rstrip('/')
+    destino = base + url_for(endpoint, id=id) if base else url_for(endpoint, id=id, _external=True)
+    buffer = BytesIO()
+    qrcode.make(destino).save(buffer, format='PNG')
+    buffer.seek(0)
+    response = send_file(buffer, mimetype='image/png', as_attachment=request.args.get('descargar') == '1', download_name=f'{tipo}-{id}.png', max_age=0)
+    response.headers['Cache-Control'] = 'private, no-store'
+    return response
 
 
 @app.errorhandler(403)
